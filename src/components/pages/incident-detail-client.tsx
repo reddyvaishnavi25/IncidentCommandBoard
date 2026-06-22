@@ -1,10 +1,11 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { ArrowLeft, MapPin, Users, AlertTriangle } from "lucide-react";
+import { ArrowLeft, MapPin, Users, AlertTriangle, X } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { ResourceAssignPanel } from "@/components/resource-assign-panel";
 import { LiveCollaboration } from "@/components/live-collaboration";
 import { AICommander } from "@/components/ai-commander";
@@ -12,9 +13,11 @@ import { ConsistencyMonitor } from "@/components/consistency-monitor";
 import {
   getIncidentDetailAction,
   getResourcesAction,
+  releaseResourceAction,
 } from "@/lib/actions/crisis-actions";
 import { hasPermission } from "@/lib/permissions";
 import { severityColor, formatRelativeTime } from "@/lib/utils";
+import { toast } from "sonner";
 import type { SessionUser } from "@/lib/auth/types";
 
 export function IncidentDetailClient({
@@ -24,6 +27,8 @@ export function IncidentDetailClient({
   user: SessionUser;
   incidentId: string;
 }) {
+  const queryClient = useQueryClient();
+
   const { data, isLoading } = useQuery({
     queryKey: ["incident", incidentId],
     queryFn: () => getIncidentDetailAction(incidentId),
@@ -35,6 +40,21 @@ export function IncidentDetailClient({
     queryFn: getResourcesAction,
     refetchInterval: 5000,
   });
+
+  const releaseMutation = useMutation({
+    mutationFn: ({ resourceId }: { resourceId: string; callSign: string }) =>
+      releaseResourceAction(resourceId, incidentId),
+    onSuccess: (result, variables) => {
+      if (result.success) {
+        toast.success(result.message);
+      } else {
+        toast.error(result.message);
+      }
+      queryClient.invalidateQueries();
+    },
+  });
+
+  const canRelease = hasPermission(user.role, "manage_resources");
 
   if (isLoading || !data) {
     return (
@@ -133,9 +153,23 @@ export function IncidentDetailClient({
                         <p className="font-mono text-sm font-medium text-zinc-200">{a.callSign}</p>
                         <p className="text-xs text-zinc-500">{a.name} · {a.type.replace("_", " ")}</p>
                       </div>
-                      <div className="text-right">
-                        <Badge variant="secondary">{a.status}</Badge>
-                        <p className="text-[10px] text-zinc-600 mt-1">by {a.assignedByName}</p>
+                      <div className="flex items-center gap-2">
+                        <div className="text-right">
+                          <Badge variant="secondary">{a.status}</Badge>
+                          <p className="text-[10px] text-zinc-600 mt-1">by {a.assignedByName}</p>
+                        </div>
+                        {canRelease && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 w-7 p-0 text-zinc-500 hover:text-red-400 hover:bg-red-500/10"
+                            disabled={releaseMutation.isPending}
+                            onClick={() => releaseMutation.mutate({ resourceId: a.resourceId, callSign: a.callSign })}
+                            title={`Release ${a.callSign}`}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
                       </div>
                     </div>
                   ))}

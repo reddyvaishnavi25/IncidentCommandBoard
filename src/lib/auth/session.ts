@@ -12,7 +12,7 @@ export async function getSession(): Promise<SessionUser | null> {
   if (!sessionId) return null;
 
   try {
-    const db = requireDb();
+    const db = await requireDb();
     const [user] = await db
       .select({
         id: users.id,

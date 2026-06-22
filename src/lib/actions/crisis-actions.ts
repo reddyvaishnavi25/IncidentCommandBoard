@@ -1,6 +1,6 @@
 "use server";
 
-import { eq, and, desc, sql, lte, count } from "drizzle-orm";
+import { eq, and, desc, sql, lte, count, isNull } from "drizzle-orm";
 import { requireDb } from "@/lib/db";
 import {
   consistencyMetrics,
@@ -25,7 +25,7 @@ import { hasPermission } from "@/lib/permissions";
 import type { UserRole } from "@/lib/permissions";
 
 async function ensureMetrics() {
-  const db = requireDb();
+  const db = await requireDb();
   const [existing] = await db.select().from(consistencyMetrics).limit(1);
   if (!existing) {
     await db.insert(consistencyMetrics).values({});
@@ -41,7 +41,7 @@ async function incrementMetric(
     | "rejectedTransactions",
   amount = 1
 ) {
-  const db = requireDb();
+  const db = await requireDb();
   await ensureMetrics();
   const [metrics] = await db.select().from(consistencyMetrics).limit(1);
   if (!metrics) return;
@@ -77,7 +77,7 @@ export async function assignResourceAction(
     return { success: false, message: "Insufficient permissions to assign resources." };
   }
 
-  const db = requireDb();
+  const db = await requireDb();
   const transactionId = crypto.randomUUID();
 
   try {
@@ -86,7 +86,7 @@ export async function assignResourceAction(
         .select()
         .from(resources)
         .where(eq(resources.id, resourceId))
-        .for("update");
+        .limit(1);
 
       if (!resource) {
         await tx.insert(auditLogs).values({
@@ -251,6 +251,98 @@ export async function assignResourceAction(
   }
 }
 
+export async function releaseResourceAction(
+  resourceId: string,
+  incidentId: string
+): Promise<{ success: boolean; message: string }> {
+  const session = await requireSession();
+  if (!hasPermission(session.role, "manage_resources")) {
+    return { success: false, message: "Insufficient permissions to release resources." };
+  }
+
+  const db = await requireDb();
+
+  try {
+    const result = await db.transaction(async (tx) => {
+      const [resource] = await tx
+        .select()
+        .from(resources)
+        .where(eq(resources.id, resourceId))
+        .limit(1);
+
+      if (!resource) {
+        return { success: false, message: "Resource not found." };
+      }
+
+      const [assignment] = await tx
+        .select()
+        .from(resourceAssignments)
+        .where(
+          and(
+            eq(resourceAssignments.resourceId, resourceId),
+            eq(resourceAssignments.incidentId, incidentId),
+            isNull(resourceAssignments.releasedAt)
+          )
+        )
+        .limit(1);
+
+      if (!assignment) {
+        return { success: false, message: "No active assignment found for this resource." };
+      }
+
+      await tx
+        .update(resourceAssignments)
+        .set({ status: "released", releasedAt: new Date() })
+        .where(eq(resourceAssignments.id, assignment.id));
+
+      const [updated] = await tx
+        .update(resources)
+        .set({
+          status: "available",
+          currentIncidentId: null,
+          version: resource.version + 1,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(resources.id, resourceId), eq(resources.version, resource.version)))
+        .returning();
+
+      if (!updated) {
+        return { success: false, message: "Concurrent modification detected. Please retry." };
+      }
+
+      await tx.insert(timelineEvents).values({
+        incidentId,
+        eventType: "resource_released",
+        title: `${resource.callSign} released`,
+        description: `${session.name} (${session.agencyName}) released ${resource.name} back to available.`,
+        userId: session.id,
+        agencyId: session.agencyId,
+      });
+
+      await tx.insert(auditLogs).values({
+        action: "release_resource",
+        entityType: "resource",
+        entityId: resourceId,
+        userId: session.id,
+        details: JSON.stringify({ incidentId, assignmentId: assignment.id }),
+        success: true,
+      });
+
+      return { success: true, message: `${resource.callSign} released and available.`, callSign: resource.callSign };
+    });
+
+    if (result.success) {
+      broadcastEvent("resource_released", { resourceId, incidentId });
+      broadcastEvent("consistency_updated", {});
+    }
+
+    return result;
+  } catch (error) {
+    console.error("Release transaction failed:", error);
+    return { success: false, message: "Transaction failed. Please retry." };
+  }
+}
+
 export async function createIncidentAction(data: {
   title: string;
   description?: string;
@@ -266,7 +358,7 @@ export async function createIncidentAction(data: {
     return { success: false, message: "Insufficient permissions." };
   }
 
-  const db = requireDb();
+  const db = await requireDb();
   const incidentNumber = generateIncidentNumber();
 
   const [incident] = await db
@@ -306,7 +398,7 @@ export async function addIncidentUpdateAction(incidentId: string, content: strin
     return { success: false, message: "Insufficient permissions." };
   }
 
-  const db = requireDb();
+  const db = await requireDb();
   const [update] = await db
     .insert(incidentUpdates)
     .values({
@@ -351,7 +443,7 @@ export async function updateIncidentAction(
     return { success: false, message: "Insufficient permissions." };
   }
 
-  const db = requireDb();
+  const db = await requireDb();
   const [existing] = await db.select().from(incidents).where(eq(incidents.id, incidentId));
 
   if (!existing) return { success: false, message: "Incident not found." };
@@ -400,7 +492,7 @@ export async function updateResourceStatusAction(
   status: string
 ) {
   const session = await requireSession();
-  const db = requireDb();
+  const db = await requireDb();
 
   const [resource] = await db
     .update(resources)
@@ -418,21 +510,32 @@ export async function updatePresenceAction(
   isTyping = false
 ) {
   const session = await requireSession();
-  const db = requireDb();
+  const db = await requireDb();
 
-  await db
-    .insert(presence)
-    .values({
+  const incidentCondition = incidentId
+    ? eq(presence.incidentId, incidentId)
+    : isNull(presence.incidentId);
+
+  const [existing] = await db
+    .select({ id: presence.id })
+    .from(presence)
+    .where(and(eq(presence.userId, session.id), incidentCondition))
+    .limit(1);
+
+  if (existing) {
+    await db
+      .update(presence)
+      .set({ pageContext, isTyping, lastSeenAt: new Date() })
+      .where(eq(presence.id, existing.id));
+  } else {
+    await db.insert(presence).values({
       userId: session.id,
       incidentId,
       pageContext,
       isTyping,
       lastSeenAt: new Date(),
-    })
-    .onConflictDoUpdate({
-      target: [presence.userId, presence.incidentId],
-      set: { pageContext, isTyping, lastSeenAt: new Date() },
     });
+  }
 
   broadcastEvent("presence_updated", {
     userId: session.id,
@@ -445,7 +548,7 @@ export async function updatePresenceAction(
 }
 
 export async function getConsistencyMetricsAction() {
-  const db = requireDb();
+  const db = await requireDb();
   await ensureMetrics();
   const [metrics] = await db.select().from(consistencyMetrics).limit(1);
   const [conflictCount] = await db.select({ count: count() }).from(conflictLogs);
@@ -463,7 +566,7 @@ export async function getConsistencyMetricsAction() {
 }
 
 export async function getCommandCenterDataAction() {
-  const db = requireDb();
+  const db = await requireDb();
   const activeIncidents = await db
     .select()
     .from(incidents)
@@ -500,7 +603,7 @@ export async function getCommandCenterDataAction() {
 }
 
 export async function getIncidentDetailAction(incidentId: string) {
-  const db = requireDb();
+  const db = await requireDb();
   const [incident] = await db.select().from(incidents).where(eq(incidents.id, incidentId));
   if (!incident) return null;
 
@@ -523,6 +626,7 @@ export async function getIncidentDetailAction(incidentId: string) {
   const assignments = await db
     .select({
       id: resourceAssignments.id,
+      resourceId: resourceAssignments.resourceId,
       status: resourceAssignments.status,
       assignedAt: resourceAssignments.assignedAt,
       callSign: resources.callSign,
@@ -533,7 +637,7 @@ export async function getIncidentDetailAction(incidentId: string) {
     .from(resourceAssignments)
     .innerJoin(resources, eq(resourceAssignments.resourceId, resources.id))
     .innerJoin(users, eq(resourceAssignments.assignedById, users.id))
-    .where(eq(resourceAssignments.incidentId, incidentId))
+    .where(and(eq(resourceAssignments.incidentId, incidentId), isNull(resourceAssignments.releasedAt)))
     .orderBy(desc(resourceAssignments.assignedAt));
 
   const timeline = await db
@@ -558,7 +662,7 @@ export async function getIncidentDetailAction(incidentId: string) {
 }
 
 export async function getResourcesAction() {
-  const db = requireDb();
+  const db = await requireDb();
   return db
     .select({
       id: resources.id,
@@ -578,7 +682,7 @@ export async function getResourcesAction() {
 }
 
 export async function getMapDataAction() {
-  const db = requireDb();
+  const db = await requireDb();
   const activeIncidents = await db
     .select()
     .from(incidents)
@@ -592,7 +696,7 @@ export async function getMapDataAction() {
 }
 
 export async function getReplayDataAction(incidentId: string, timestamp?: string) {
-  const db = requireDb();
+  const db = await requireDb();
   const cutoff = timestamp ? new Date(timestamp) : new Date();
 
   const timeline = await db
@@ -633,7 +737,7 @@ export async function runHurricaneSimulationAction() {
     return { success: false, message: "Only Emergency Managers can run simulations." };
   }
 
-  const db = requireDb();
+  const db = await requireDb();
   const [simulation] = await db
     .insert(simulations)
     .values({
@@ -772,7 +876,7 @@ export async function runHurricaneSimulationAction() {
 }
 
 export async function getAIRecommendationsAction(incidentId: string) {
-  const db = requireDb();
+  const db = await requireDb();
   const [incident] = await db.select().from(incidents).where(eq(incidents.id, incidentId));
   if (!incident) return [];
 
@@ -861,7 +965,7 @@ export async function getAIRecommendationsAction(incidentId: string) {
 }
 
 export async function getConflictLogsAction() {
-  const db = requireDb();
+  const db = await requireDb();
   return db
     .select({
       id: conflictLogs.id,
@@ -879,7 +983,7 @@ export async function getConflictLogsAction() {
 }
 
 export async function getTimelineForReplayAction(incidentId: string) {
-  const db = requireDb();
+  const db = await requireDb();
   const events = await db
     .select()
     .from(timelineEvents)
@@ -896,7 +1000,7 @@ export async function getTimelineForReplayAction(incidentId: string) {
 }
 
 export async function loginAction(email: string, password: string) {
-  const db = requireDb();
+  const db = await requireDb();
   const bcrypt = await import("bcryptjs");
   const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
   if (!user) return { success: false, message: "Invalid credentials." };
@@ -915,7 +1019,7 @@ export async function logoutAction() {
 }
 
 export async function getDemoUsersAction() {
-  const db = requireDb();
+  const db = await requireDb();
   return db
     .select({
       id: users.id,
