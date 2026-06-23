@@ -442,6 +442,9 @@ export async function updateIncidentAction(
   if (!hasPermission(session.role, "edit_incident")) {
     return { success: false, message: "Insufficient permissions." };
   }
+  if ((data.status || data.severity) && !hasPermission(session.role, "manage_incident")) {
+    return { success: false, message: "Only dispatch and emergency managers can change incident status or severity." };
+  }
 
   const db = await requireDb();
   const [existing] = await db.select().from(incidents).where(eq(incidents.id, incidentId));

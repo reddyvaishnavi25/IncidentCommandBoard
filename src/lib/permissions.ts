@@ -10,6 +10,7 @@ export type Permission =
   | "view_incidents"
   | "create_incident"
   | "edit_incident"
+  | "manage_incident"
   | "assign_resources"
   | "view_resources"
   | "manage_resources"
@@ -56,6 +57,7 @@ const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     "view_incidents",
     "create_incident",
     "edit_incident",
+    "manage_incident",
     "assign_resources",
     "view_resources",
     "manage_resources",
@@ -69,6 +71,7 @@ const ROLE_PERMISSIONS: Record<UserRole, Permission[]> = {
     "view_incidents",
     "create_incident",
     "edit_incident",
+    "manage_incident",
     "assign_resources",
     "view_resources",
     "manage_resources",
