@@ -442,6 +442,9 @@ export async function updateIncidentAction(
   if (!hasPermission(session.role, "edit_incident")) {
     return { success: false, message: "Insufficient permissions." };
   }
+  if ((data.status || data.severity) && !hasPermission(session.role, "manage_incident")) {
+    return { success: false, message: "Only dispatch and emergency managers can change incident status or severity." };
+  }
 
   const db = await requireDb();
   const [existing] = await db.select().from(incidents).where(eq(incidents.id, incidentId));
@@ -600,6 +603,16 @@ export async function getCommandCenterDataAction() {
     agencies: agencyList,
     metrics,
   };
+}
+
+export async function getIncidentsListAction() {
+  const db = await requireDb();
+  const rows = await db
+    .select()
+    .from(incidents)
+    .orderBy(desc(incidents.severity), desc(incidents.updatedAt))
+    .limit(200);
+  return { incidents: rows };
 }
 
 export async function getIncidentDetailAction(incidentId: string) {
