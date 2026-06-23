@@ -605,6 +605,16 @@ export async function getCommandCenterDataAction() {
   };
 }
 
+export async function getIncidentsListAction() {
+  const db = await requireDb();
+  const rows = await db
+    .select()
+    .from(incidents)
+    .orderBy(desc(incidents.severity), desc(incidents.updatedAt))
+    .limit(200);
+  return { incidents: rows };
+}
+
 export async function getIncidentDetailAction(incidentId: string) {
   const db = await requireDb();
   const [incident] = await db.select().from(incidents).where(eq(incidents.id, incidentId));
