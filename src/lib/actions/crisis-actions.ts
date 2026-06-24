@@ -605,6 +605,24 @@ export async function getCommandCenterDataAction() {
   };
 }
 
+export async function getPublicDashboardAction() {
+  const db = await requireDb();
+  const allIncidents = await db
+    .select()
+    .from(incidents)
+    .orderBy(desc(incidents.updatedAt))
+    .limit(50);
+
+  const events = await db
+    .select()
+    .from(timelineEvents)
+    .where(sql`${timelineEvents.eventType} != 'ai_recommendation'`)
+    .orderBy(desc(timelineEvents.createdAt))
+    .limit(500);
+
+  return { incidents: allIncidents, events };
+}
+
 export async function getIncidentsListAction() {
   const db = await requireDb();
   const rows = await db
