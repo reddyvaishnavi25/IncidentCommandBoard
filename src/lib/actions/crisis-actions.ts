@@ -32,40 +32,37 @@ async function ensureMetrics() {
   }
 }
 
-async function incrementMetric(
-  field:
-    | "transactionsProcessed"
-    | "conflictsPrevented"
-    | "duplicateAssignmentsPrevented"
-    | "lostUpdates"
-    | "rejectedTransactions",
-  amount = 1
-) {
+type MetricField =
+  | "transactionsProcessed"
+  | "conflictsPrevented"
+  | "duplicateAssignmentsPrevented"
+  | "lostUpdates"
+  | "rejectedTransactions";
+
+/**
+ * Atomically increments one or more consistency metrics in a single UPDATE.
+ * The consistency score is recomputed in-database from the post-increment
+ * totals, so this avoids the previous read-modify-write round-trips (which
+ * ran a SELECT + SELECT + UPDATE per field, up to 4 times per assignment).
+ */
+async function incrementMetrics(increments: Partial<Record<MetricField, number>>) {
+  const entries = Object.entries(increments).filter(([, v]) => v) as [MetricField, number][];
+  if (entries.length === 0) return;
+
   const db = await requireDb();
   await ensureMetrics();
-  const [metrics] = await db.select().from(consistencyMetrics).limit(1);
-  if (!metrics) return;
 
-  const updated = {
-    transactionsProcessed: metrics.transactionsProcessed,
-    conflictsPrevented: metrics.conflictsPrevented,
-    duplicateAssignmentsPrevented: metrics.duplicateAssignmentsPrevented,
-    lostUpdates: metrics.lostUpdates,
-    rejectedTransactions: metrics.rejectedTransactions,
-  };
-  updated[field] += amount;
+  const incProcessed = increments.transactionsProcessed ?? 0;
+  const incRejected = increments.rejectedTransactions ?? 0;
 
-  const total = updated.transactionsProcessed || 1;
-  const score = Math.max(0, 100 - (updated.rejectedTransactions / total) * 100);
+  const set: Record<string, unknown> = { updatedAt: new Date() };
+  for (const [field, amount] of entries) {
+    set[field] = sql`${consistencyMetrics[field]} + ${amount}`;
+  }
+  // Recompute score from the new totals, clamped to [0, 100].
+  set.consistencyScore = sql`GREATEST(0, 100 - (${consistencyMetrics.rejectedTransactions} + ${incRejected})::numeric / GREATEST(${consistencyMetrics.transactionsProcessed} + ${incProcessed}, 1) * 100)`;
 
-  await db
-    .update(consistencyMetrics)
-    .set({
-      ...updated,
-      consistencyScore: score.toFixed(2),
-      updatedAt: new Date(),
-    })
-    .where(eq(consistencyMetrics.id, metrics.id));
+  await db.update(consistencyMetrics).set(set);
 }
 
 export async function assignResourceAction(
@@ -212,17 +209,23 @@ export async function assignResourceAction(
       };
     });
 
-    await incrementMetric("transactionsProcessed");
-
     if (result.conflict) {
-      await incrementMetric("conflictsPrevented");
-      await incrementMetric("duplicateAssignmentsPrevented");
-      await incrementMetric("rejectedTransactions");
+      await incrementMetrics({
+        transactionsProcessed: 1,
+        conflictsPrevented: 1,
+        duplicateAssignmentsPrevented: 1,
+        rejectedTransactions: 1,
+      });
     } else if (result.lostUpdate) {
-      await incrementMetric("lostUpdates");
-      await incrementMetric("rejectedTransactions");
+      await incrementMetrics({
+        transactionsProcessed: 1,
+        lostUpdates: 1,
+        rejectedTransactions: 1,
+      });
     } else if (result.rejected) {
-      await incrementMetric("rejectedTransactions");
+      await incrementMetrics({ transactionsProcessed: 1, rejectedTransactions: 1 });
+    } else {
+      await incrementMetrics({ transactionsProcessed: 1 });
     }
 
     if (result.success) {
@@ -246,7 +249,7 @@ export async function assignResourceAction(
     return result;
   } catch (error) {
     console.error("Assignment transaction failed:", error);
-    await incrementMetric("rejectedTransactions");
+    await incrementMetrics({ rejectedTransactions: 1 });
     return { success: false, message: "Transaction failed. Please retry." };
   }
 }
@@ -387,7 +390,7 @@ export async function createIncidentAction(data: {
     agencyId: session.agencyId,
   });
 
-  await incrementMetric("transactionsProcessed");
+  await incrementMetrics({ transactionsProcessed: 1 });
   broadcastEvent("incident_created", { incident });
   return { success: true, incident };
 }
@@ -462,8 +465,8 @@ export async function updateIncidentAction(
     .returning();
 
   if (!updated) {
-    await incrementMetric("lostUpdates");
-    return { success: false, message: "Concurrent edit detected. Refresh and retry." };
+      await incrementMetrics({ lostUpdates: 1 });
+      return { success: false, message: "Concurrent edit detected. Refresh and retry." };
   }
 
   if (data.status && data.status !== existing.status) {
@@ -577,9 +580,20 @@ export async function getCommandCenterDataAction() {
     .orderBy(desc(incidents.severity), desc(incidents.updatedAt))
     .limit(20);
 
-  const allResources = await db.select().from(resources);
-  const availableCount = allResources.filter((r) => r.status === "available").length;
-  const assignedCount = allResources.filter((r) => r.status !== "available").length;
+  // Aggregate resource counts in the database instead of loading every row.
+  const statusCounts = await db
+    .select({ status: resources.status, count: count() })
+    .from(resources)
+    .groupBy(resources.status);
+
+  const byStatus: Record<string, number> = {};
+  let total = 0;
+  for (const row of statusCounts) {
+    const n = Number(row.count);
+    byStatus[row.status] = n;
+    total += n;
+  }
+  const availableCount = byStatus["available"] ?? 0;
 
   const recentTimeline = await db
     .select()
@@ -593,11 +607,11 @@ export async function getCommandCenterDataAction() {
   return {
     activeIncidents,
     resourceStats: {
-      total: allResources.length,
+      total,
       available: availableCount,
-      assigned: assignedCount,
-      enRoute: allResources.filter((r) => r.status === "en_route").length,
-      onScene: allResources.filter((r) => r.status === "on_scene").length,
+      assigned: total - availableCount,
+      enRoute: byStatus["en_route"] ?? 0,
+      onScene: byStatus["on_scene"] ?? 0,
     },
     recentTimeline,
     agencies: agencyList,
@@ -793,28 +807,35 @@ export async function runHurricaneSimulationAction() {
 
   const severities = ["low", "medium", "high", "critical", "catastrophic"] as const;
   let updatesGenerated = 0;
-  let conflictsPrevented = 0;
+  const conflictsPrevented = 0;
 
   const baseLat = 30.2672;
   const baseLng = -97.7431;
 
-  for (let i = 0; i < 100; i++) {
-    const title = incidentTitles[i % incidentTitles.length] + ` #${i + 1}`;
-    await db.insert(incidents).values({
-      incidentNumber: generateIncidentNumber(),
-      title,
-      description: `Hurricane simulation incident ${i + 1}`,
-      status: i < 80 ? "active" : "contained",
-      severity: severities[i % severities.length],
-      location: `Sim Zone ${Math.floor(i / 10) + 1}, Travis County`,
-      latitude: (baseLat + (Math.random() - 0.5) * 0.3).toFixed(7),
-      longitude: (baseLng + (Math.random() - 0.5) * 0.3).toFixed(7),
-      casualties: Math.floor(Math.random() * 20),
-      injuries: Math.floor(Math.random() * 50),
-      createdById: session.id,
-    });
-    updatesGenerated += 3;
+  // Insert rows in batches to respect Aurora DSQL's 3,000-rows-per-transaction
+  // limit while avoiding thousands of sequential round-trips.
+  const BATCH_SIZE = 500;
+  async function batchInsert<T>(table: Parameters<typeof db.insert>[0], rows: T[]) {
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      await db.insert(table).values(rows.slice(i, i + BATCH_SIZE) as never);
+    }
   }
+
+  const incidentRows = Array.from({ length: 100 }, (_, i) => ({
+    incidentNumber: generateIncidentNumber(),
+    title: incidentTitles[i % incidentTitles.length] + ` #${i + 1}`,
+    description: `Hurricane simulation incident ${i + 1}`,
+    status: i < 80 ? "active" : "contained",
+    severity: severities[i % severities.length],
+    location: `Sim Zone ${Math.floor(i / 10) + 1}, Travis County`,
+    latitude: (baseLat + (Math.random() - 0.5) * 0.3).toFixed(7),
+    longitude: (baseLng + (Math.random() - 0.5) * 0.3).toFixed(7),
+    casualties: Math.floor(Math.random() * 20),
+    injuries: Math.floor(Math.random() * 50),
+    createdById: session.id,
+  }));
+  await batchInsert(incidents, incidentRows);
+  updatesGenerated += 100 * 3;
 
   const agencyList = await db.select().from(agencies);
   const types = [
@@ -826,35 +847,29 @@ export async function runHurricaneSimulationAction() {
     "search_rescue",
   ] as const;
 
-  for (let i = 0; i < 500; i++) {
-    const agency = agencyList[i % agencyList.length];
+  const resourceRows = Array.from({ length: 500 }, (_, i) => {
     const type = types[i % types.length];
-    const callSign = `SIM-${type.toUpperCase().slice(0, 3)}-${String(i + 1).padStart(3, "0")}`;
-    try {
-      await db.insert(resources).values({
-        callSign,
-        name: `Sim ${type.replace("_", " ")} ${i + 1}`,
-        type,
-        status: i % 5 === 0 ? "available" : "assigned",
-        agencyId: agency.id,
-        latitude: (baseLat + (Math.random() - 0.5) * 0.3).toFixed(7),
-        longitude: (baseLng + (Math.random() - 0.5) * 0.3).toFixed(7),
-      });
-    } catch {
-      conflictsPrevented++;
-    }
-    updatesGenerated += 2;
-  }
+    return {
+      callSign: `SIM-${type.toUpperCase().slice(0, 3)}-${String(i + 1).padStart(3, "0")}`,
+      name: `Sim ${type.replace("_", " ")} ${i + 1}`,
+      type,
+      status: i % 5 === 0 ? "available" : "assigned",
+      agencyId: agencyList[i % agencyList.length].id,
+      latitude: (baseLat + (Math.random() - 0.5) * 0.3).toFixed(7),
+      longitude: (baseLng + (Math.random() - 0.5) * 0.3).toFixed(7),
+    };
+  });
+  await batchInsert(resources, resourceRows);
+  updatesGenerated += 500 * 2;
 
-  for (let i = 0; i < 900; i++) {
-    await db.insert(timelineEvents).values({
-      eventType: "simulation_event",
-      title: `Simulation update ${i + 1}`,
-      description: `Automated hurricane response update batch ${Math.floor(i / 100) + 1}`,
-      metadata: JSON.stringify({ simulationId: simulation.id, batch: i }),
-    });
-    updatesGenerated++;
-  }
+  const timelineRows = Array.from({ length: 900 }, (_, i) => ({
+    eventType: "simulation_event",
+    title: `Simulation update ${i + 1}`,
+    description: `Automated hurricane response update batch ${Math.floor(i / 100) + 1}`,
+    metadata: JSON.stringify({ simulationId: simulation.id, batch: i }),
+  }));
+  await batchInsert(timelineEvents, timelineRows);
+  updatesGenerated += 900;
 
   await db
     .update(simulations)
@@ -868,22 +883,10 @@ export async function runHurricaneSimulationAction() {
     })
     .where(eq(simulations.id, simulation.id));
 
-  await ensureMetrics();
-  const [metrics] = await db.select().from(consistencyMetrics).limit(1);
-  if (metrics) {
-    const newProcessed = metrics.transactionsProcessed + updatesGenerated;
-    const newConflicts = metrics.conflictsPrevented + conflictsPrevented;
-    const score = Math.max(0, 100 - (metrics.rejectedTransactions / newProcessed) * 100);
-    await db
-      .update(consistencyMetrics)
-      .set({
-        transactionsProcessed: newProcessed,
-        conflictsPrevented: newConflicts,
-        consistencyScore: score.toFixed(2),
-        updatedAt: new Date(),
-      })
-      .where(eq(consistencyMetrics.id, metrics.id));
-  }
+  await incrementMetrics({
+    transactionsProcessed: updatesGenerated,
+    conflictsPrevented,
+  });
 
   broadcastEvent("simulation_completed", {
     simulationId: simulation.id,
