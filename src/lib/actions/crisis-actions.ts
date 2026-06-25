@@ -254,6 +254,82 @@ export async function assignResourceAction(
   }
 }
 
+export interface RaceSimulationResult {
+  success: boolean;
+  message: string;
+  attempts: number;
+  committed: number;
+  rejected: number;
+  callSign?: string;
+  results?: { success: boolean; message: string }[];
+}
+
+/**
+ * Fires N concurrent assignment attempts at the SAME resource to demonstrate
+ * Aurora DSQL's optimistic concurrency control. Exactly one transaction should
+ * commit; the rest are rejected (duplicate assignment / lost update / OC001).
+ * Reuses the real assignResourceAction so the demo exercises the production path.
+ */
+export async function simulateAssignmentRaceAction(
+  resourceId: string,
+  incidentId: string,
+  attempts = 5
+): Promise<RaceSimulationResult> {
+  const session = await requireSession();
+  if (!hasPermission(session.role, "assign_resources")) {
+    return {
+      success: false,
+      message: "Insufficient permissions to simulate assignment race.",
+      attempts: 0,
+      committed: 0,
+      rejected: 0,
+    };
+  }
+
+  const db = await requireDb();
+  const [resource] = await db
+    .select({ callSign: resources.callSign, status: resources.status })
+    .from(resources)
+    .where(eq(resources.id, resourceId))
+    .limit(1);
+
+  if (!resource) {
+    return { success: false, message: "Resource not found.", attempts: 0, committed: 0, rejected: 0 };
+  }
+  if (resource.status !== "available") {
+    return {
+      success: false,
+      message: `${resource.callSign} is not available (currently ${resource.status.replace("_", " ")}). Pick an available unit.`,
+      attempts: 0,
+      committed: 0,
+      rejected: 0,
+    };
+  }
+
+  const n = Math.min(Math.max(attempts, 2), 10);
+
+  // Fire all attempts simultaneously against the same resource.
+  const settled = await Promise.all(
+    Array.from({ length: n }, () => assignResourceAction(resourceId, incidentId))
+  );
+
+  const results = settled.map((r) => ({ success: r.success, message: r.message }));
+  const committed = results.filter((r) => r.success).length;
+  const rejected = results.length - committed;
+
+  broadcastEvent("consistency_updated", {});
+
+  return {
+    success: true,
+    message: `${n} dispatchers raced for ${resource.callSign}: ${committed} committed, ${rejected} rejected by Aurora DSQL.`,
+    attempts: n,
+    committed,
+    rejected,
+    callSign: resource.callSign,
+    results,
+  };
+}
+
 export async function releaseResourceAction(
   resourceId: string,
   incidentId: string

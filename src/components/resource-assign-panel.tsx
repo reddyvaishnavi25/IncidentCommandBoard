@@ -3,10 +3,14 @@
 import React, { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
-import { Truck, AlertCircle, CheckCircle2 } from "lucide-react";
+import { Truck, AlertCircle, CheckCircle2, Swords } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { assignResourceAction } from "@/lib/actions/crisis-actions";
+import {
+  assignResourceAction,
+  simulateAssignmentRaceAction,
+  type RaceSimulationResult,
+} from "@/lib/actions/crisis-actions";
 import { statusColor } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -52,6 +56,28 @@ export function ResourceAssignPanel({
     },
   });
 
+  const [raceResult, setRaceResult] = React.useState<RaceSimulationResult | null>(null);
+
+  const raceMutation = useMutation({
+    mutationFn: ({ resourceId }: { resourceId: string; callSign: string }) =>
+      simulateAssignmentRaceAction(resourceId, incidentId, 5),
+    onSuccess: (data) => {
+      setRaceResult(data);
+      if (!data.success) {
+        toast.error(data.message);
+      } else if (data.committed === 1) {
+        toast.success(`Race resolved: 1 committed, ${data.rejected} rejected`, {
+          description: "Aurora DSQL optimistic concurrency held the line.",
+          duration: 8000,
+        });
+      } else {
+        toast.warning(`Race resolved: ${data.committed} committed, ${data.rejected} rejected`);
+      }
+      queryClient.invalidateQueries();
+    },
+  });
+
+  const busy = mutation.isPending || raceMutation.isPending;
   const available = resources.filter((r) => r.status === "available");
 
   return (
@@ -98,6 +124,39 @@ export function ResourceAssignPanel({
         )}
       </AnimatePresence>
 
+      <AnimatePresence mode="wait">
+        {raceResult && raceResult.success && (
+          <motion.div
+            key={raceResult.message}
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            className="rounded-lg bg-sky-500/10 p-4 ring-1 ring-sky-500/30"
+          >
+            <div className="flex items-start gap-3">
+              <Swords className="h-5 w-5 shrink-0 text-sky-400" />
+              <div className="w-full">
+                <p className="font-semibold text-sky-300">
+                  Concurrency Race: {raceResult.callSign}
+                </p>
+                <div className="mt-2 flex gap-2">
+                  <Badge className="bg-emerald-500/20 text-emerald-300">
+                    {raceResult.committed} committed
+                  </Badge>
+                  <Badge className="bg-red-500/20 text-red-300">
+                    {raceResult.rejected} rejected
+                  </Badge>
+                  <Badge variant="secondary">{raceResult.attempts} simultaneous</Badge>
+                </div>
+                <p className="mt-2 font-mono text-xs text-sky-300/80">
+                  Aurora DSQL OCC: only one transaction wins the version check; the rest roll back.
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <div className="max-h-64 space-y-2 overflow-y-auto">
         {available.length === 0 ? (
           <p className="text-sm text-zinc-500">No available resources</p>
@@ -117,14 +176,26 @@ export function ResourceAssignPanel({
                 </div>
               </div>
               {canAssign && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={mutation.isPending}
-                  onClick={() => mutation.mutate({ resourceId: r.id, callSign: r.callSign })}
-                >
-                  Assign
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => mutation.mutate({ resourceId: r.id, callSign: r.callSign })}
+                  >
+                    Assign
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy}
+                    title="Fire 5 simultaneous assignments to demo Aurora DSQL concurrency control"
+                    onClick={() => raceMutation.mutate({ resourceId: r.id, callSign: r.callSign })}
+                  >
+                    <Swords className="mr-1 h-3.5 w-3.5" />
+                    Race 5x
+                  </Button>
+                </div>
               )}
             </div>
           ))
