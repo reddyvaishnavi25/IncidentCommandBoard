@@ -1,9 +1,9 @@
 "use client";
 
-import React, { useState } from "react";
+import React from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
-import { Truck, AlertCircle, CheckCircle2, Swords } from "lucide-react";
+import { Truck, AlertCircle, CheckCircle2, Swords, Loader2, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -38,12 +38,14 @@ export function ResourceAssignPanel({
     message: string;
     callSign?: string;
   } | null>(null);
+  const [raceResult, setRaceResult] = React.useState<RaceSimulationResult | null>(null);
 
   const mutation = useMutation({
     mutationFn: ({ resourceId }: { resourceId: string; callSign: string }) =>
       assignResourceAction(resourceId, incidentId),
     onSuccess: (data, variables) => {
       setLastResult({ ...data, callSign: variables.callSign });
+      setRaceResult(null);
       if (data.success) {
         toast.success(data.message);
       } else {
@@ -56,11 +58,14 @@ export function ResourceAssignPanel({
     },
   });
 
-  const [raceResult, setRaceResult] = React.useState<RaceSimulationResult | null>(null);
-
   const raceMutation = useMutation({
     mutationFn: ({ resourceId }: { resourceId: string; callSign: string }) =>
       simulateAssignmentRaceAction(resourceId, incidentId, 5),
+    onMutate: () => {
+      // Clear previous results as soon as race starts
+      setLastResult(null);
+      setRaceResult(null);
+    },
     onSuccess: (data) => {
       setRaceResult(data);
       if (!data.success) {
@@ -89,6 +94,7 @@ export function ResourceAssignPanel({
         <Badge variant="secondary">{available.length} available</Badge>
       </div>
 
+      {/* Regular assign result */}
       <AnimatePresence mode="wait">
         {lastResult && (
           <motion.div
@@ -124,8 +130,32 @@ export function ResourceAssignPanel({
         )}
       </AnimatePresence>
 
+      {/* Race loading state */}
       <AnimatePresence mode="wait">
-        {raceResult && raceResult.success && (
+        {raceMutation.isPending && (
+          <motion.div
+            key="race-loading"
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0 }}
+            className="rounded-lg bg-sky-500/10 p-4 ring-1 ring-sky-500/30"
+          >
+            <div className="flex items-center gap-3">
+              <Loader2 className="h-5 w-5 shrink-0 animate-spin text-sky-400" />
+              <div>
+                <p className="font-semibold text-sky-300">Racing 5 dispatchers simultaneously…</p>
+                <p className="mt-1 text-xs text-zinc-400">
+                  All 5 transactions fired at once — Aurora DSQL will allow only one to commit.
+                </p>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Race result — aggregate + per-transaction breakdown */}
+      <AnimatePresence mode="wait">
+        {raceResult && raceResult.success && !raceMutation.isPending && (
           <motion.div
             key={raceResult.message}
             initial={{ opacity: 0, y: -10 }}
@@ -134,12 +164,12 @@ export function ResourceAssignPanel({
             className="rounded-lg bg-sky-500/10 p-4 ring-1 ring-sky-500/30"
           >
             <div className="flex items-start gap-3">
-              <Swords className="h-5 w-5 shrink-0 text-sky-400" />
-              <div className="w-full">
+              <Swords className="mt-0.5 h-5 w-5 shrink-0 text-sky-400" />
+              <div className="w-full min-w-0">
                 <p className="font-semibold text-sky-300">
                   Concurrency Race: {raceResult.callSign}
                 </p>
-                <div className="mt-2 flex gap-2">
+                <div className="mt-2 flex flex-wrap gap-2">
                   <Badge className="bg-emerald-500/20 text-emerald-300">
                     {raceResult.committed} committed
                   </Badge>
@@ -148,7 +178,34 @@ export function ResourceAssignPanel({
                   </Badge>
                   <Badge variant="secondary">{raceResult.attempts} simultaneous</Badge>
                 </div>
-                <p className="mt-2 font-mono text-xs text-sky-300/80">
+
+                {/* Per-transaction breakdown */}
+                {raceResult.results && raceResult.results.length > 0 && (
+                  <div className="mt-3 space-y-1.5">
+                    {raceResult.results.map((r, i) => (
+                      <motion.div
+                        key={i}
+                        initial={{ opacity: 0, x: -8 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ delay: i * 0.06 }}
+                        className={`flex items-center gap-2 rounded px-2 py-1 text-xs font-mono ${
+                          r.success
+                            ? "bg-emerald-500/10 text-emerald-300"
+                            : "bg-red-500/10 text-red-300/80"
+                        }`}
+                      >
+                        {r.success ? (
+                          <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                        ) : (
+                          <XCircle className="h-3.5 w-3.5 shrink-0 text-red-400/70" />
+                        )}
+                        <span>{r.message}</span>
+                      </motion.div>
+                    ))}
+                  </div>
+                )}
+
+                <p className="mt-3 font-mono text-xs text-sky-300/70">
                   Aurora DSQL OCC: only one transaction wins the version check; the rest roll back.
                 </p>
               </div>
@@ -192,7 +249,11 @@ export function ResourceAssignPanel({
                     title="Fire 5 simultaneous assignments to demo Aurora DSQL concurrency control"
                     onClick={() => raceMutation.mutate({ resourceId: r.id, callSign: r.callSign })}
                   >
-                    <Swords className="mr-1 h-3.5 w-3.5" />
+                    {raceMutation.isPending ? (
+                      <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Swords className="mr-1 h-3.5 w-3.5" />
+                    )}
                     Race 5x
                   </Button>
                 </div>

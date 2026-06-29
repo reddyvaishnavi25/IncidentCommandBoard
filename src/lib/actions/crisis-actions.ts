@@ -265,10 +265,10 @@ export interface RaceSimulationResult {
 }
 
 /**
- * Fires N concurrent assignment attempts at the SAME resource to demonstrate
- * Aurora DSQL's optimistic concurrency control. Exactly one transaction should
- * commit; the rest are rejected (duplicate assignment / lost update / OC001).
- * Reuses the real assignResourceAction so the demo exercises the production path.
+ * Fires N concurrent DB transactions at the SAME resource to demonstrate
+ * Aurora DSQL's optimistic concurrency control. Runs the locking logic inline
+ * (no per-call requireSession/requireDb overhead) and batches metrics into one
+ * write, so the round-trip is as fast as possible for demo purposes.
  */
 export async function simulateAssignmentRaceAction(
   resourceId: string,
@@ -288,7 +288,7 @@ export async function simulateAssignmentRaceAction(
 
   const db = await requireDb();
   const [resource] = await db
-    .select({ callSign: resources.callSign, status: resources.status })
+    .select({ callSign: resources.callSign, status: resources.status, version: resources.version })
     .from(resources)
     .where(eq(resources.id, resourceId))
     .limit(1);
@@ -308,15 +308,69 @@ export async function simulateAssignmentRaceAction(
 
   const n = Math.min(Math.max(attempts, 2), 10);
 
-  // Fire all attempts simultaneously against the same resource.
+  // Fire all n transactions concurrently — each reads the current version and
+  // tries to increment it. Aurora DSQL's OCC means only one wins; the rest get
+  // a version mismatch and return no updated row → rejected.
   const settled = await Promise.all(
-    Array.from({ length: n }, () => assignResourceAction(resourceId, incidentId))
+    Array.from({ length: n }, (_, i) =>
+      db
+        .transaction(async (tx) => {
+          const [current] = await tx
+            .select({ status: resources.status, version: resources.version })
+            .from(resources)
+            .where(eq(resources.id, resourceId))
+            .limit(1);
+
+          if (!current || current.status !== "available") {
+            return { success: false, message: `Dispatcher ${i + 1}: Rejected — unit already taken.` };
+          }
+
+          const [updated] = await tx
+            .update(resources)
+            .set({
+              status: "assigned",
+              currentIncidentId: incidentId,
+              version: current.version + 1,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(resources.id, resourceId), eq(resources.version, current.version)))
+            .returning({ id: resources.id });
+
+          if (!updated) {
+            return { success: false, message: `Dispatcher ${i + 1}: Rejected — optimistic lock conflict.` };
+          }
+
+          await tx.insert(resourceAssignments).values({
+            resourceId,
+            incidentId,
+            assignedById: session.id,
+            status: "assigned",
+          });
+
+          return { success: true, message: `Dispatcher ${i + 1}: Committed — ${resource.callSign} assigned.` };
+        })
+        .catch(() => ({ success: false, message: `Dispatcher ${i + 1}: Aborted by Aurora DSQL.` }))
+    )
   );
 
   const results = settled.map((r) => ({ success: r.success, message: r.message }));
   const committed = results.filter((r) => r.success).length;
   const rejected = results.length - committed;
 
+  // Single batched metrics write instead of N separate writes
+  await incrementMetrics({
+    transactionsProcessed: n,
+    conflictsPrevented: rejected,
+    duplicateAssignmentsPrevented: rejected,
+    rejectedTransactions: rejected,
+  });
+
+  broadcastEvent("resource_assigned", {
+    resourceId,
+    incidentId,
+    assignedBy: session.name,
+    callSign: resource.callSign,
+  });
   broadcastEvent("consistency_updated", {});
 
   return {
