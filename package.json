@@ -12,7 +12,8 @@
     "db:studio": "drizzle-kit studio",
     "db:seed": "tsx --env-file=.env scripts/seed.ts",
     "db:token": "tsx --env-file=.env scripts/gen-dsql-url.ts",
-    "db:reset": "tsx --env-file=.env scripts/reset-db.ts"
+    "db:reset": "tsx --env-file=.env scripts/reset-db.ts",
+    "db:indexes": "tsx --env-file=.env scripts/add-indexes.ts"
   },
   "dependencies": {
     "@aws-sdk/dsql-signer": "^3.1073.0",
